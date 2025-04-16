@@ -2,135 +2,96 @@
 import os
 import sys
 import pickle
-from typing import Any, Dict, List, Optional, Sequence, Union
 import traceback
 import copy
-import torch # Added torch
+from typing import Any, Dict, List, Optional, Sequence, Union
 
-# --- LangChain Imports ---
+# --- LangChain Imports (Keep) ---
 from langchain.prompts import PromptTemplate
 from langchain_openai import AzureChatOpenAI
 from langchain.chains.llm import LLMChain
 from langchain.chains.combine_documents.stuff import StuffDocumentsChain
 from langchain.chains.mapreduce import MapReduceDocumentsChain
-# --- LLM Imports ---
-# from langchain_openai import AzureChatOpenAI # Keep if you might switch back
-from langchain_google_genai import ChatGoogleGenerativeAI # USE THIS
-# --- Core Imports ---
 from langchain_core.documents import Document
 from langchain_core.runnables import RunnablePassthrough
 from langchain.globals import set_debug
-from langchain.schema.vectorstore import VectorStoreRetriever
 
-# --- Reranker Import ---
+# --- ColBERT Imports ---
 try:
-    from sentence_transformers.cross_encoder import CrossEncoder
+    from colbert import Searcher
+    from colbert.infra import ColBERTConfig, Run, RunConfig
 except ImportError:
-    print("ERROR: sentence-transformers library not found. Reranking will be disabled.")
-    print("Please install it: pip install -U sentence-transformers")
-    CrossEncoder = None # Define as None if import fails
-
-# --- NEW: Transformers Import ---
-try:
-    from transformers import AutoModelForMaskedLM, AutoTokenizer
-except ImportError:
-    print("ERROR: transformers library not found. Please install it: pip install transformers torch")
-    AutoModelForMaskedLM, AutoTokenizer = None, None # Define as None if import fails
+    print("ERROR: colbert-ai library not found. ColBERT search will be disabled.")
+    print("Please install it: pip install colbert-ai[faiss-cpu,torch]")
+    Searcher = None
+    ColBERTConfig = None
 
 # --- Local Imports ---
-# Ensure the project root is in the path
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 # --- Updated Config Imports ---
 from config import (
-    TEMPERATURE, MAX_TOKENS, PERSIST_DIRECTORY,
-    PROJECT_NAME, RETRIEVAL_TYPE, TOP_K,
-    # SPLADE Config
-    SPLADE_MODEL_NAME, SPLADE_VECTORS_FILENAME, SPLADE_DOCS_FILENAME, SPLADE_TOP_N,
-    # Reranker Config
-    RERANKER_ENABLED, RERANKER_MODEL_NAME,
-    # Azure Config (Remove Google API Key)
+    TEMPERATURE, MAX_TOKENS, PROJECT_NAME,
+    # ColBERT Config
+    COLBERT_INDEX_ROOT, COLBERT_INDEX_NAME,
+    COLBERT_METADATA_MAP_FILENAME, COLBERT_PID_DOCID_MAP_FILENAME,
+    # Azure Config (Keep)
     AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY,
     AZURE_OPENAI_API_VERSION, AZURE_OPENAI_DEPLOYMENT_NAME
 )
-try:
-    from config import SIMILARITY_SCORE_THRESHOLD
-except ImportError:
-    SIMILARITY_SCORE_THRESHOLD = 0.7
 
-# --- Vectorstore Import ---
-from langchain_utils.vectorstore import load_faiss_vectorstore, embeddings
-
-# --- System Prompt Import ---
+# --- System Prompt Import (Keep) ---
 try:
     from system_prompt import system_prompt
     print("--- Successfully imported system_prompt from system_prompt.py ---")
 except ImportError:
     print("--- WARNING: Could not import system_prompt. Using a basic default for Reduce step. ---")
-    # Define a basic fallback if system_prompt.py is missing
     system_prompt = """
 You are a helpful AI assistant. Synthesize the provided summaries to answer the question based *only* on the summaries. Attribute information using the metadata (Source, Customer, Clause). If the question asks for specific information (e.g., 'chilled temperature'), only include data explicitly matching that criteria from the summaries. If no matching information is found for a requested entity, state that clearly.
-"""
+""" # Keep fallback
 
 
 # --- Global Variables ---
 map_reduce_chain: Optional[MapReduceDocumentsChain] = None
-vectorstore = None
-retriever: Optional[VectorStoreRetriever] = None
-llm_instance: Optional[AzureChatOpenAI] = None # LLM for MapReduce
+llm_instance: Optional[AzureChatOpenAI] = None
 detected_customer_names: List[str] = []
 CUSTOMER_LIST_FILE = "detected_customers.txt"
 
-# --- NEW: SPLADE Globals ---
-splade_model = None
-splade_tokenizer = None
-splade_vectors: List[Dict[int, float]] = []
-splade_docs: List[Document] = []
+# --- ColBERT Globals ---
+colbert_searcher: Optional[Searcher] = None
+colbert_metadata_map: Dict[str, Dict] = {}
+colbert_pid_docid_map: Dict[int, str] = {}
 
-# --- REMOVED: BM25 Globals ---
-# bm25_index = None
-# bm25_docs: List[Document] = []
-
-# --- Reranker Global ---
-reranker_model = None
-# RERANKER_MODEL_NAME is imported from config
-
-# --- Check Azure Credentials (Done in config.py, but good practice) ---
+# --- Check Azure Credentials (Keep) ---
 if not all([AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, AZURE_OPENAI_DEPLOYMENT_NAME]):
     print("CRITICAL ERROR in qa_chain.py: Azure OpenAI credentials missing in config. LLM initialization will fail.")
-    # sys.exit(1) # Optional exit
 
 
-# --- MapReduce Chain Setup ---
+# --- MapReduce Chain Setup (Keep as is) ---
 def setup_map_reduce_chain() -> MapReduceDocumentsChain:
     global llm_instance
     if llm_instance is None:
-        # Check credentials again before instantiation
         if not all([AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, AZURE_OPENAI_DEPLOYMENT_NAME]):
              raise ValueError("Azure OpenAI credentials not found in config. Cannot initialize LLM.")
         try:
-            # --- Initialize Azure OpenAI ---
-            print(f"Initializing AzureChatOpenAI (Deployment: {AZURE_OPENAI_DEPLOYMENT_NAME})...") # Update log
+            print(f"Initializing AzureChatOpenAI (Deployment: {AZURE_OPENAI_DEPLOYMENT_NAME})...")
             llm_instance = AzureChatOpenAI(
                 azure_endpoint=AZURE_OPENAI_ENDPOINT,
                 api_key=AZURE_OPENAI_API_KEY,
                 api_version=AZURE_OPENAI_API_VERSION,
-                azure_deployment=AZURE_OPENAI_DEPLOYMENT_NAME, # Use azure_deployment
+                azure_deployment=AZURE_OPENAI_DEPLOYMENT_NAME,
                 temperature=TEMPERATURE,
-                max_tokens=MAX_TOKENS, # Use max_tokens
-                # model_name=AZURE_OPENAI_MODEL_NAME, # Optional if deployment implies model
+                max_tokens=MAX_TOKENS,
             )
-            print("AzureChatOpenAI initialized successfully.") # Update log
+            print("AzureChatOpenAI initialized successfully.")
         except Exception as e:
-             print(f"ERROR initializing AzureChatOpenAI: {e}") # Update log
+             print(f"ERROR initializing AzureChatOpenAI: {e}")
              traceback.print_exc()
-             sys.exit(1) # Exit if LLM fails to initialize
+             sys.exit(1)
 
-    llm = llm_instance # Use the initialized Azure LLM
-
-    # --- Stricter Map Prompt ---
+    llm = llm_instance
     map_template = """
 You will be provided with a document excerpt preceded by its source metadata (Source, Page, Customer, Clause).
 Your task is to analyze ONLY the text of the document excerpt BELOW the '---' line.
@@ -155,15 +116,9 @@ Document Excerpt with Metadata:
 
 **Output:**
 """
-
-    map_prompt = PromptTemplate(
-        input_variables=["page_content", "question"],
-        template=map_template
-    )
-    # Use the same LLM for map and reduce unless performance/cost dictates otherwise
+    map_prompt = PromptTemplate(input_variables=["page_content", "question"], template=map_template)
     map_chain = LLMChain(llm=llm, prompt=map_prompt, verbose=True)
 
-    # --- Reduce Prompt (Uses system_prompt) ---
     reduce_template = f"""
 {system_prompt}
 
@@ -175,27 +130,22 @@ Extracted Information Summaries (Metadata --- Content):
 Based *only* on the summaries above and following all instructions in the initial system prompt (especially regarding strict grounding, requested entities, and specific query terms like 'chilled'), provide the final answer to the Original User Question. If multiple summaries provide relevant details for the same point, synthesize them concisely. If summaries indicate no specific information was found for a requested entity or criteria (e.g., 'chilled temperature for Patties'), explicitly state that in the final answer.
 
 Final Answer:"""
-    reduce_prompt = PromptTemplate(
-        input_variables=["doc_summaries", "question"],
-        template=reduce_template
-        )
+    reduce_prompt = PromptTemplate(input_variables=["doc_summaries", "question"], template=reduce_template)
     reduce_llm_chain = LLMChain(llm=llm, prompt=reduce_prompt, verbose=True)
 
-    # --- Combine Setup ---
     combine_documents_chain = StuffDocumentsChain(
         llm_chain=reduce_llm_chain,
         document_variable_name="doc_summaries",
-        document_separator="\n\n---\n\n", # Separator used between map outputs
+        document_separator="\n\n---\n\n",
         verbose=True
     )
 
-    # --- MapReduce Chain ---
     chain = MapReduceDocumentsChain(
-        llm_chain=map_chain, # The chain for the map step
-        reduce_documents_chain=combine_documents_chain, # The chain for the reduce step
-        document_variable_name="page_content", # Input variable name in map_prompt
-        input_key="input_documents", # Input key for the overall chain
-        output_key="output_text", # Output key for the overall chain
+        llm_chain=map_chain,
+        reduce_documents_chain=combine_documents_chain,
+        document_variable_name="page_content",
+        input_key="input_documents",
+        output_key="output_text",
         verbose=True
     )
     return chain
@@ -203,79 +153,92 @@ Final Answer:"""
 
 # --- Application Initialization ---
 def initialize_app():
-    """Initializes vectorstore, retriever, SPLADE, reranker, chain, and detected customer names."""
-    # Add SPLADE globals
-    global vectorstore, retriever, map_reduce_chain, detected_customer_names
-    global splade_model, splade_tokenizer, splade_vectors, splade_docs # NEW
-    global reranker_model, llm_instance
-    set_debug(True) # Or set based on config
+    """Initializes ColBERT searcher, LLM chain, and detected customer names."""
+    global map_reduce_chain, detected_customer_names, llm_instance
+    global colbert_searcher, colbert_metadata_map, colbert_pid_docid_map
+    set_debug(True)
 
     print("Initializing application components...")
 
-    # --- Load FAISS Vectorstore (Unchanged) ---
-    if not os.path.exists(PERSIST_DIRECTORY) or not os.listdir(PERSIST_DIRECTORY):
-         print(f"CRITICAL ERROR: FAISS index directory '{PERSIST_DIRECTORY}' not found or empty.")
+    # --- Load ColBERT Index and Mappings ---
+    colbert_base_path = os.path.abspath(os.path.join(project_root, COLBERT_INDEX_ROOT)) # .../LLM_Legal_V55/colbert_indices
+    # Maps are still directly in the base path
+    metadata_map_path = os.path.join(colbert_base_path, COLBERT_METADATA_MAP_FILENAME)
+    pid_docid_map_path = os.path.join(colbert_base_path, COLBERT_PID_DOCID_MAP_FILENAME)
+
+    # --- Path where the index is expected to be built by default ---
+    # Includes the default experiment structure relative to the root used during indexing
+    expected_nested_index_path = os.path.join(colbert_base_path, "experiments", "default", "indexes", COLBERT_INDEX_NAME) # <<< PATH FOR CHECKING/DEBUGGING
+
+    if not Searcher or not ColBERTConfig:
+        print("CRITICAL ERROR: ColBERT library not loaded correctly. Exiting.")
+        sys.exit(1)
+
+    # --- MODIFIED CHECKS ---
+    # 1. Check if the BASE directory exists (where maps should be)
+    print(f"DEBUG: Checking for ColBERT base path: {colbert_base_path}")
+    if not os.path.exists(colbert_base_path):
+         print(f"CRITICAL ERROR: ColBERT base directory '{colbert_base_path}' not found.")
          print("Please run 'python build_indices.py' first.")
          sys.exit(1)
-    vectorstore = load_faiss_vectorstore(persist_directory=PERSIST_DIRECTORY)
-    if not vectorstore:
-        print("CRITICAL ERROR: Failed to load FAISS vectorstore. Exiting.")
-        sys.exit(1)
-    print("FAISS vectorstore loaded.")
 
-    # --- NEW: Load SPLADE Model and Data ---
-    splade_vectors_path = os.path.join(PERSIST_DIRECTORY, SPLADE_VECTORS_FILENAME)
-    splade_docs_path = os.path.join(PERSIST_DIRECTORY, SPLADE_DOCS_FILENAME)
-    if AutoModelForMaskedLM is None: # Check if transformers loaded
-        print("CRITICAL ERROR: Transformers library not loaded. Cannot initialize SPLADE.")
-        sys.exit(1)
+    # 2. Check if map files exist
+    if not os.path.exists(metadata_map_path):
+         print(f"CRITICAL ERROR: ColBERT metadata map '{metadata_map_path}' not found.")
+         print("Please run 'python build_indices.py' first.")
+         sys.exit(1)
+    if not os.path.exists(pid_docid_map_path):
+         print(f"CRITICAL ERROR: ColBERT PID->DocID map '{pid_docid_map_path}' not found.")
+         print("Please run 'python build_indices.py' first.")
+         sys.exit(1)
+
+    # 3. Add a check for the nested path just for logging confirmation
+    print(f"DEBUG: Also checking expected nested index path: {expected_nested_index_path}")
+    if not os.path.exists(expected_nested_index_path):
+        # This is now just a warning, as the Searcher might still find it
+        print(f"WARN: The expected nested index path '{expected_nested_index_path}' was NOT found by os.path.exists(). Will proceed assuming Searcher can locate it.")
+
     try:
-        print(f"Loading SPLADE model: {SPLADE_MODEL_NAME}...")
-        splade_tokenizer = AutoTokenizer.from_pretrained(SPLADE_MODEL_NAME)
-        splade_model = AutoModelForMaskedLM.from_pretrained(SPLADE_MODEL_NAME)
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        splade_model.to(device)
-        splade_model.eval() # Set to evaluation mode
-        print(f"SPLADE model '{SPLADE_MODEL_NAME}' loaded successfully to {device}.")
+        print(f"Loading ColBERT metadata map from {metadata_map_path}...")
+        with open(metadata_map_path, "rb") as f:
+            colbert_metadata_map = pickle.load(f)
+        print(f"Loading ColBERT PID->DocID map from {pid_docid_map_path}...")
+        with open(pid_docid_map_path, "rb") as f:
+            colbert_pid_docid_map = pickle.load(f)
+        print("ColBERT maps loaded successfully.")
 
-        if os.path.exists(splade_vectors_path) and os.path.exists(splade_docs_path):
-            print(f"Loading SPLADE vectors from {splade_vectors_path}...")
-            with open(splade_vectors_path, "rb") as f: splade_vectors = pickle.load(f)
-            with open(splade_docs_path, "rb") as f: splade_docs = pickle.load(f)
-            print(f"SPLADE vectors and documents loaded successfully ({len(splade_docs)} documents).")
-        else:
-            print(f"WARN: SPLADE vectors or document list not found in {PERSIST_DIRECTORY}.")
-            print("SPLADE search will not be available. Please run 'python build_indices.py'.")
-            splade_vectors, splade_docs = [], [] # Ensure lists are empty
+        print(f"Initializing ColBERT Searcher for index '{COLBERT_INDEX_NAME}' relative to root '{colbert_base_path}'...")
+        # --- MODIFIED Searcher Initialization ---
+        # Initialize Searcher simply with the index name and the root path.
+        # Let the Searcher handle finding the index within the root/experiment structure.
+        searcher_root_path = colbert_base_path # The path containing 'experiments' dir
+        # Create a minimal config just specifying the root for the Searcher
+        config_for_search = ColBERTConfig(
+            root=searcher_root_path
+            # experiment='default' # Usually not needed if root is correct
+        )
+        colbert_searcher = Searcher(
+            index=COLBERT_INDEX_NAME,
+            config=config_for_search # Pass the config specifying the root
+        )
+        # --- End Modification ---
+        print("ColBERT Searcher initialized successfully.")
+
     except Exception as e:
-        print(f"ERROR loading SPLADE model or data: {e}")
+        # If Searcher init fails, it might provide a more specific error
+        print(f"CRITICAL ERROR initializing ColBERT Searcher or loading maps: {e}")
+        # Check if the error message indicates the index wasn't found by the Searcher itself
+        if "Missing:" in str(e) or "directory not found" in str(e).lower() or "AssertionError: index_path" in str(e):
+             print(f"-> Searcher failed to find index components for '{COLBERT_INDEX_NAME}' within '{colbert_base_path}'.")
+             print(f"-> Expected structure might be: '{expected_nested_index_path}'")
+             print(f"-> Ensure 'build_indices.py' completed successfully and created the index there.")
         traceback.print_exc()
-        # Set to None/empty on error to allow readiness check to fail
-        splade_model, splade_tokenizer, splade_vectors, splade_docs = None, None, [], []
+        sys.exit(1)
 
-
-    # --- REMOVED: Load BM25 Index and Documents ---
-    # bm25_index_path = os.path.join(PERSIST_DIRECTORY, BM25_INDEX_FILENAME)
-    # bm25_docs_path = os.path.join(PERSIST_DIRECTORY, BM25_DOCS_FILENAME)
-    # if os.path.exists(bm25_index_path) and os.path.exists(bm25_docs_path):
-    #     print(f"Loading BM25 index from {bm25_index_path}...")
-    #     try:
-    #         with open(bm25_index_path, "rb") as f: bm25_index = pickle.load(f)
-    #         with open(bm25_docs_path, "rb") as f: bm25_docs = pickle.load(f)
-    #         print(f"BM25 index and documents loaded successfully ({len(bm25_docs)} documents).")
-    #     except Exception as e:
-    #         print(f"ERROR loading BM25 index or documents: {e}")
-    #         bm25_index, bm25_docs = None, []
-    # else:
-    #     print(f"WARN: BM25 index or document list not found in {PERSIST_DIRECTORY}.")
-    #     print("BM25 search will not be available. Please run 'python build_indices.py'.")
-    #     bm25_index, bm25_docs = None, []
-
-    # --- Load Detected Customer Names (Unchanged) ---
+    # --- Load Detected Customer Names (Keep as is) ---
     try:
-        customer_list_path = os.path.join(project_root, CUSTOMER_LIST_FILE) # Use absolute path
+        customer_list_path = os.path.join(project_root, CUSTOMER_LIST_FILE)
         with open(customer_list_path, "r") as f:
-            # Use set for uniqueness, then sort
             names = sorted(list(set(line.strip() for line in f if line.strip() and line.strip() != "Unknown Customer")))
             detected_customer_names = names
         print(f"Loaded {len(detected_customer_names)} unique customer names from {customer_list_path}.")
@@ -286,54 +249,8 @@ def initialize_app():
         print(f"Error loading {CUSTOMER_LIST_FILE}: {e}")
         detected_customer_names = []
 
-    # --- Retriever Setup (FAISS - Unchanged) ---
-    if vectorstore:
-        try:
-            search_kwargs = {}
-            if RETRIEVAL_TYPE == "similarity_score_threshold":
-                search_kwargs['score_threshold'] = SIMILARITY_SCORE_THRESHOLD
-                search_kwargs['k'] = TOP_K # Also pass K for threshold search
-                print(f"Initializing FAISS retriever: type='similarity_score_threshold', threshold={SIMILARITY_SCORE_THRESHOLD}, k={TOP_K}")
-            else: # Default to similarity (top-k)
-                search_kwargs['k'] = TOP_K
-                print(f"Initializing FAISS retriever: type='similarity', k={TOP_K}")
-
-            retriever = vectorstore.as_retriever(
-                search_type=RETRIEVAL_TYPE,
-                search_kwargs=search_kwargs
-            )
-            print("FAISS retriever initialized successfully.")
-        except Exception as e:
-             print(f"CRITICAL ERROR creating FAISS retriever: {e}")
-             traceback.print_exc()
-             sys.exit(1)
-    else:
-        # This case should have been caught by vectorstore loading check
-        print("CRITICAL ERROR: Vectorstore not available. Cannot create retriever.")
-        sys.exit(1)
-
-    # --- Load Reranker Model (Unchanged) ---
-    if RERANKER_ENABLED:
-        if CrossEncoder:
-            try:
-                print(f"Loading Reranker model: {RERANKER_MODEL_NAME}...")
-                reranker_model = CrossEncoder(RERANKER_MODEL_NAME, max_length=512, trust_remote_code=True) # Default to CPU/auto
-                print(f"Reranker model '{RERANKER_MODEL_NAME}' loaded successfully.")
-            except Exception as e:
-                print(f"ERROR loading Reranker model '{RERANKER_MODEL_NAME}': {e}")
-                print("Reranking will be disabled.")
-                traceback.print_exc()
-                reranker_model = None # Ensure it's None on error
-        else:
-            print("WARN: CrossEncoder class not available (sentence-transformers not installed?). Reranking disabled.")
-            reranker_model = None # Ensure it's None if import failed
-    else:
-        print("INFO: Reranking is disabled in config.")
-        reranker_model = None # Ensure it's None if disabled
-
-    # --- Chain Setup (Calls setup_map_reduce_chain which now uses Azure) ---
+    # --- Chain Setup (Keep as is) ---
     try:
-        # setup_map_reduce_chain will initialize llm_instance if it's None
         map_reduce_chain = setup_map_reduce_chain()
         print("MapReduce chain initialized successfully (using Azure OpenAI).")
     except Exception as e:
@@ -343,11 +260,10 @@ def initialize_app():
 
     print("Application initialization complete.")
 
-# --- Function to get detected names (Unchanged) ---
+# --- Function to get detected names (Keep as is) ---
 def get_detected_customer_names() -> List[str]:
     """Returns the list of customer names detected during initialization."""
     global detected_customer_names
-    # No warning needed here, just return the current state
     return detected_customer_names
 
 # --- Direct Execution Test Block (Optional - Unchanged) ---

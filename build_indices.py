@@ -1,60 +1,48 @@
 # build_indices.py
-
 import os
 import sys
 import pickle
 import shutil
-from typing import List, Dict, Tuple # Added Dict, Tuple
 import traceback
-import torch # Added torch
+import re # For cleaning IDs
+from typing import List # Make sure this is imported
 
 # Add project root to sys.path
 project_root = os.path.dirname(os.path.abspath(__file__))
 if project_root not in sys.path:
-    sys.path.insert(0, project_root) # Ensure project root is searched first
+    sys.path.insert(0, project_root)
 
 # --- Local Imports ---
-# --- Updated Config Imports ---
 from config import (
-    PDF_DIR, PERSIST_DIRECTORY,
-    SPLADE_MODEL_NAME, SPLADE_VECTORS_FILENAME, SPLADE_DOCS_FILENAME # Use SPLADE config
+    PDF_DIR,
+    COLBERT_MODEL_NAME,
+    COLBERT_INDEX_ROOT,
+    COLBERT_INDEX_NAME,
+    COLBERT_METADATA_MAP_FILENAME,
+    COLBERT_PID_DOCID_MAP_FILENAME,
+    # AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY # Needed for pdf_extractor
 )
-from langchain_utils.vectorstore import create_and_save_faiss_vectorstore
 from document_processing.pdf_extractor import extract_documents_from_pdf
 from document_processing.parser import pyparse_hierarchical_chunk_text
 from langchain_core.documents import Document
 
-# --- NEW: Import Transformers ---
-try:
-    from transformers import AutoModelForMaskedLM, AutoTokenizer
-except ImportError:
-    print("ERROR: transformers library not found. Please install it: pip install transformers torch")
-    sys.exit(1)
+# --- ColBERT Imports ---
+from colbert import Indexer
+from colbert.infra import ColBERTConfig
 
-# --- REMOVED: BM25 Import ---
-# try:
-#     from rank_bm25 import BM25Okapi
-# except ImportError:
-#     print("ERROR: rank_bm25 library not found. Please install it: pip install rank_bm25")
-#     sys.exit(1)
-
-# Define paths relative to this script's location or use absolute paths
+# --- Define paths ---
 PDF_DIR_ABS = os.path.abspath(os.path.join(os.path.dirname(__file__), PDF_DIR))
-PERSIST_DIRECTORY_ABS = os.path.abspath(os.path.join(os.path.dirname(__file__), PERSIST_DIRECTORY))
-
-# --- NEW: SPLADE Index Paths ---
-SPLADE_VECTORS_PATH = os.path.join(PERSIST_DIRECTORY_ABS, SPLADE_VECTORS_FILENAME)
-SPLADE_DOCS_PATH = os.path.join(PERSIST_DIRECTORY_ABS, SPLADE_DOCS_FILENAME)
-
-# --- REMOVED: BM25 Paths ---
-# BM25_INDEX_PATH = os.path.join(PERSIST_DIRECTORY_ABS, BM25_INDEX_FILENAME)
-# BM25_DOCS_PATH = os.path.join(PERSIST_DIRECTORY_ABS, BM25_DOCS_FILENAME)
+# Define root path for ColBERT related files (maps, parent of index dir)
+COLBERT_BASE_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), COLBERT_INDEX_ROOT))
+# Paths for our mapping files (within the base path)
+METADATA_MAP_PATH = os.path.join(COLBERT_BASE_PATH, COLBERT_METADATA_MAP_FILENAME)
+PID_DOCID_MAP_PATH = os.path.join(COLBERT_BASE_PATH, COLBERT_PID_DOCID_MAP_FILENAME)
 
 CUSTOMER_LIST_FILE = "detected_customers.txt"
 CUSTOMER_LIST_PATH = os.path.join(project_root, CUSTOMER_LIST_FILE)
 
 
-# --- Document Loading and Parsing Logic (Unchanged from your provided code) ---
+# --- Document Loading and Parsing Logic (Unchanged) ---
 def load_all_documents_for_indexing(pdf_directory):
     """Loads PDFs, extracts pages, parses hierarchically for indexing."""
     all_final_documents = []
@@ -149,113 +137,110 @@ def load_all_documents_for_indexing(pdf_directory):
     return all_final_documents
 
 
-# --- NEW: SPLADE Indexing Function ---
-def build_and_save_splade(
-    documents: List[Document],
-    model,
-    tokenizer,
-    vectors_save_path: str,
-    docs_save_path: str,
-    batch_size: int = 4 # Adjust based on GPU memory
-) -> Tuple[List[Dict[int, float]], List[Document]]:
-    """Builds and saves SPLADE sparse vectors and the corresponding documents."""
+# --- Function to Build ColBERT Index ---
+def build_colbert_index(documents: List[Document]):
+    """Builds and saves a ColBERT index from LangChain documents."""
     if not documents:
-        print("ERROR: No documents provided to build SPLADE index.")
-        return None, None
+        print("ERROR: No documents provided to build ColBERT index.")
+        return False
 
-    print(f"\nPreparing and encoding data for SPLADE from {len(documents)} chunks...")
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model.to(device)
-    model.eval() # Set model to evaluation mode
+    print(f"\nPreparing data for ColBERT indexing ({len(documents)} documents)...")
 
-    splade_vectors = []
-    splade_docs = documents # Keep the full Document objects
+    # --- 1. Prepare data in ColBERT format (List of strings) & Metadata Map ---
+    collection = []
+    # Modify metadata_map to store content AND metadata
+    metadata_map = {} # Dictionary: doc_id -> {'page_content': str, 'metadata': dict}
+    doc_id_counter = 0
 
-    doc_contents = [doc.page_content for doc in splade_docs]
+    for doc in documents:
+        doc_id = f"doc_{doc_id_counter}"
+        doc_id_counter += 1
 
-    for i in range(0, len(doc_contents), batch_size):
-        batch_texts = doc_contents[i:i+batch_size]
-        tokens = tokenizer(batch_texts, return_tensors='pt', padding=True, truncation=True, max_length=512).to(device)
+        content = doc.page_content or ""
+        cleaned_content = content.replace('\t', ' ').replace('\n', ' ').replace('\r', ' ')
+        collection.append(cleaned_content) # ColBERT still just needs the text
 
-        with torch.no_grad():
-            # Get the MLM logits, aggregate over sequence length using max pooling
-            # Compute the vector ('v') representation for the batch
-            doc_reps = model(input_ids=tokens['input_ids'], attention_mask=tokens['attention_mask'])[0] # [batch, seq_len, vocab_size]
-            # Use ReLU activation and max pooling over sequence length
-            doc_reps_activated = torch.relu(doc_reps)
-            pooled_reps, _ = torch.max(doc_reps_activated * tokens['attention_mask'].unsqueeze(-1), dim=1) # [batch, vocab_size]
-            # Apply log saturation
-            pooled_reps_log_sat = torch.log1p(pooled_reps)
+        # --- Store BOTH content and metadata in the map --- <<< MODIFIED
+        metadata_map[doc_id] = {
+            'page_content': content, # Store original content
+            'metadata': doc.metadata # Store original metadata dict
+        }
+        # --- End Modification ---
 
-        # Convert to sparse dictionary format
-        batch_vectors = pooled_reps_log_sat.cpu().numpy()
-        for vec in batch_vectors:
-            indices = vec.nonzero()[0]
-            weights = vec[indices]
-            sparse_dict = dict(zip(indices.tolist(), weights.tolist()))
-            splade_vectors.append(sparse_dict)
+    print(f"Data prepared. {len(collection)} entries in collection.")
 
-        print(f"  Encoded batch {i//batch_size + 1}/{(len(doc_contents) + batch_size - 1)//batch_size}")
+    # --- 2. Configure and Run ColBERT Indexer ---
+    # Ensure the BASE directory exists
+    if not os.path.exists(COLBERT_BASE_PATH):
+        os.makedirs(COLBERT_BASE_PATH)
+        print(f"Created ColBERT base directory: {COLBERT_BASE_PATH}")
 
-    print(f"SPLADE encoding complete. Generated {len(splade_vectors)} sparse vectors.")
+    # --- Check and remove the *expected default* index path if it exists ---
+    # This path includes the default experiment structure
+    default_exp_index_path = os.path.join(COLBERT_BASE_PATH, "experiments", "default", "indexes", COLBERT_INDEX_NAME)
+    if os.path.exists(default_exp_index_path):
+        print(f"Removing existing ColBERT index structure at: {default_exp_index_path}")
+        # Remove the specific index dir within the experiment structure
+        shutil.rmtree(default_exp_index_path)
+        # Optionally remove parent dirs if empty, but safer to leave them
+    # --- End check ---
 
     try:
-        # Save the list of sparse vector dictionaries
-        with open(vectors_save_path, "wb") as f:
-            pickle.dump(splade_vectors, f)
-        print(f"SPLADE sparse vectors saved to {vectors_save_path}")
+        import torch
+        num_gpus = torch.cuda.device_count()
+        print(f"Detected {num_gpus} GPUs.")
+    except:
+        num_gpus = 0
+        print("WARN: Could not detect GPUs, defaulting to CPU indexing.")
 
-        # Save the list of Document objects used
-        with open(docs_save_path, "wb") as f:
-            pickle.dump(splade_docs, f)
-        print(f"SPLADE document list saved to {docs_save_path}")
+    # --- Use 'root' in ColBERTConfig ---
+    # Let ColBERT manage its experiment structure within COLBERT_BASE_PATH
+    config = ColBERTConfig(
+        root=COLBERT_BASE_PATH,          # <<< Use root for experiment structure base
+        index_name=COLBERT_INDEX_NAME, # Still needed to name the final index dir within experiments/...
+        checkpoint=COLBERT_MODEL_NAME,
+        nbits=2,
+        gpus=num_gpus,
+        doc_maxlen=220,
+        query_maxlen=32
+        # Remove index_root if present
+    )
+    # --- End Modification ---
 
-        return splade_vectors, splade_docs
+    print(f"Initializing ColBERT Indexer with config: {config}")
+    indexer = Indexer(checkpoint=COLBERT_MODEL_NAME, config=config) # Pass config
+
+    try:
+        print("Starting ColBERT indexing process (this may take a while)...")
+        # Pass the index name (used relative to root/experiment/indexes)
+        indexer.index(name=COLBERT_INDEX_NAME, collection=collection)
+        print("ColBERT indexing complete.")
+
+        # --- 3. Save the Metadata Map (Now contains content+metadata) --- <<< MODIFIED
+        print(f"Saving enhanced metadata map to {METADATA_MAP_PATH}...")
+        with open(METADATA_MAP_PATH, "wb") as f:
+            pickle.dump(metadata_map, f)
+        print("Metadata map saved.")
+        # --- End Modification ---
+
+        # --- 4. Save PID to DocID Mapping (Unchanged) ---
+        pid_docid_map = {pid: f"doc_{pid}" for pid in range(len(collection))}
+        print(f"Saving PID-to-DocID map to {PID_DOCID_MAP_PATH}...")
+        with open(PID_DOCID_MAP_PATH, "wb") as f:
+            pickle.dump(pid_docid_map, f)
+        print("PID-to-DocID map saved.")
+
+        return True
+
     except Exception as e:
-        print(f"ERROR saving SPLADE vectors or documents: {e}")
+        print(f"ERROR: ColBERT indexing failed: {e}")
         traceback.print_exc()
-        return None, None
+        return False
 
-# --- REMOVED: BM25 Indexing Function ---
-# def build_and_save_bm25(...)
 
 # --- Main Indexing Logic ---
 if __name__ == "__main__":
-    print("Starting indexing process...")
-    rebuild = len(sys.argv) > 1 and sys.argv[1] == '--rebuild'
-
-    # --- Handle rebuild ---
-    if rebuild and os.path.exists(PERSIST_DIRECTORY_ABS):
-        print(f"Rebuild requested. Removing existing index directory: {PERSIST_DIRECTORY_ABS}")
-        try:
-            shutil.rmtree(PERSIST_DIRECTORY_ABS)
-            print("Existing index directory removed.")
-        except Exception as e:
-            print(f"ERROR removing existing index directory: {e}")
-            sys.exit(1) # Exit if removal fails
-
-    if not os.path.exists(PERSIST_DIRECTORY_ABS):
-        try:
-            os.makedirs(PERSIST_DIRECTORY_ABS)
-            print(f"Created index directory: {PERSIST_DIRECTORY_ABS}")
-        except Exception as e:
-            print(f"ERROR creating index directory: {e}")
-            sys.exit(1) # Exit if creation fails
-
-    # --- Check if indices exist (unless rebuilding) ---
-    faiss_exists = os.path.exists(os.path.join(PERSIST_DIRECTORY_ABS, "index.faiss"))
-    # --- NEW: Check SPLADE files ---
-    splade_vectors_exist = os.path.exists(SPLADE_VECTORS_PATH)
-    splade_docs_exist = os.path.exists(SPLADE_DOCS_PATH)
-
-    # --- REMOVED: BM25 file checks ---
-    # bm25_model_exists = os.path.exists(BM25_INDEX_PATH)
-    # bm25_docs_exist = os.path.exists(BM25_DOCS_PATH)
-
-    # --- Updated Check ---
-    if not rebuild and faiss_exists and splade_vectors_exist and splade_docs_exist:
-        print("Indices (FAISS & SPLADE) already exist. Use '--rebuild' argument to force recreation.")
-        sys.exit(0)
+    print("Starting ColBERT indexing process...")
 
     # --- 1. Load and process documents ---
     print(f"\nLoading documents from: {PDF_DIR_ABS}")
@@ -265,46 +250,15 @@ if __name__ == "__main__":
         print("ERROR: No documents were processed. Exiting.")
         sys.exit(1)
 
-    # --- 2. Build and save FAISS index ---
-    if not faiss_exists or rebuild:
-        print("\nBuilding FAISS index...")
-        vectorstore = create_and_save_faiss_vectorstore(final_chunks, persist_directory=PERSIST_DIRECTORY_ABS)
-        if not vectorstore:
-            print("ERROR: FAISS index creation failed.")
-            sys.exit(1)
-    else:
-        print("\nFAISS index already exists. Skipping build.")
+    # --- 2. Build ColBERT Index ---
+    print("\nBuilding ColBERT index...")
+    success = build_colbert_index(final_chunks)
 
-    # --- 3. Build and save SPLADE index ---
-    if not (splade_vectors_exist and splade_docs_exist) or rebuild:
-        print("\nLoading SPLADE model for indexing...")
-        try:
-            splade_tokenizer = AutoTokenizer.from_pretrained(SPLADE_MODEL_NAME)
-            splade_model = AutoModelForMaskedLM.from_pretrained(SPLADE_MODEL_NAME)
-            print(f"SPLADE model '{SPLADE_MODEL_NAME}' loaded.")
+    if not success:
+        print("ERROR: ColBERT index creation failed.")
+        sys.exit(1)
 
-            # Pass final_chunks (which are Document objects)
-            build_and_save_splade(
-                final_chunks,
-                model=splade_model,
-                tokenizer=splade_tokenizer,
-                vectors_save_path=SPLADE_VECTORS_PATH,
-                docs_save_path=SPLADE_DOCS_PATH
-            )
-            # Add check if build_and_save_splade failed
-            if not os.path.exists(SPLADE_VECTORS_PATH) or not os.path.exists(SPLADE_DOCS_PATH):
-                 print("ERROR: SPLADE index creation/saving failed.")
-                 sys.exit(1)
-        except Exception as e:
-            print(f"ERROR during SPLADE model loading or indexing: {e}")
-            traceback.print_exc()
-            sys.exit(1)
-    else:
-        print("\nSPLADE index already exists. Skipping build.")
-
-    # --- REMOVED: BM25 build section ---
-
-    # --- 4. Update detected_customers.txt (Unchanged) ---
+    # --- 3. Update detected_customers.txt (Unchanged) ---
     print(f"\nUpdating customer list file: {CUSTOMER_LIST_PATH}")
     detected_customers = set()
     for doc in final_chunks:
@@ -338,6 +292,6 @@ if __name__ == "__main__":
             print(f"Cleared content of {CUSTOMER_LIST_FILE} as no customers were detected.")
         except Exception as e:
             print(f"ERROR clearing {CUSTOMER_LIST_FILE}: {e}")
-    # --- End of new block ---
 
-    print("\nIndexing process complete.")
+
+    print("\nColBERT Indexing process complete.")
